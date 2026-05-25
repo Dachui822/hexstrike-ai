@@ -630,8 +630,7 @@ class IntelligentDecisionEngine:
                 "httpx": 0.9,  # Great for API probing
                 "x8": 0.92,  # Excellent for hidden parameters
                 "katana": 0.85,  # Good for API endpoint discovery
-                "jaeles": 0.88,
-                "postman": 0.8
+                "jaeles": 0.88
             },
             TargetType.CLOUD_SERVICE.value: {
                 "prowler": 0.95,  # Excellent for AWS security assessment
@@ -3646,7 +3645,6 @@ class CTFToolManager:
             "jwt-cracker": "jwt-cracker",
             "graphql-voyager": "graphql-voyager",
             "graphql-playground": "graphql-playground",
-            "postman": "newman run",
             "burpsuite": "java -jar /opt/burpsuite/burpsuite.jar",
             "owasp-zap": "zap.sh -cmd",
             "websocket-king": "python3 /opt/websocket-king/ws_test.py",
@@ -6780,6 +6778,285 @@ class TelemetryCollector:
 # Global telemetry collector
 telemetry = TelemetryCollector()
 
+
+# ============================================================================
+# ASYNC TASK MANAGER (v6.2 ENHANCEMENT)
+# ============================================================================
+
+import secrets
+
+class AsyncTaskManager:
+    """异步任务管理器 — 支持长时间运行的安全扫描任务"""
+
+    def __init__(self, max_tasks=1000, cleanup_interval=3600, ttl=86400):
+        self.tasks = {}
+        self.lock = threading.Lock()
+        self.max_tasks = max_tasks
+        self.ttl = ttl
+        self._start_cleanup_thread(cleanup_interval)
+
+    def _start_cleanup_thread(self, interval):
+        def cleanup_loop():
+            while True:
+                time.sleep(interval)
+                self._cleanup_expired()
+        thread = threading.Thread(target=cleanup_loop, daemon=True)
+        thread.start()
+
+    def _cleanup_expired(self):
+        now = time.time()
+        with self.lock:
+            to_remove = []
+            for task_id, task in self.tasks.items():
+                elapsed = now - task.get("start_time", 0)
+                if task["status"] in ("completed", "failed", "cancelled"):
+                    if elapsed > self.ttl:
+                        to_remove.append(task_id)
+            if len(self.tasks) > self.max_tasks:
+                sorted_tasks = sorted(self.tasks.items(), key=lambda x: x[1].get("start_time", 0))
+                for tid, t in sorted_tasks:
+                    if len(self.tasks) <= self.max_tasks:
+                        break
+                    if t["status"] in ("completed", "failed", "cancelled"):
+                        to_remove.append(tid)
+            for tid in to_remove:
+                del self.tasks[tid]
+            if to_remove:
+                logger.info(f"🧹 AsyncTaskManager: cleaned up {len(to_remove)} expired tasks")
+
+    def create_task(self, tool_name, target, params):
+        task_id = f"{tool_name}_{int(time.time())}_{secrets.token_hex(4)}"
+        with self.lock:
+            self.tasks[task_id] = {
+                "task_id": task_id,
+                "tool": tool_name,
+                "target": target,
+                "params": {k: v for k, v in params.items() if k != "async"},
+                "status": "queued",
+                "progress": {"percentage": 0.0, "current_step": "queued", "message": "Task queued, waiting to start...", "bytes_processed": 0},
+                "start_time": time.time(),
+                "update_time": time.time(),
+                "result": None,
+                "error": None,
+                "stdout": "",
+                "stderr": "",
+                "pid": None
+            }
+        logger.info(f"📋 AsyncTaskManager: created task {task_id} for {tool_name} → {target}")
+        return task_id
+
+    def update_progress(self, task_id, percentage, step, message="", bytes_processed=0):
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id]["progress"] = {
+                    "percentage": min(100.0, max(0.0, percentage)),
+                    "current_step": step,
+                    "message": message,
+                    "bytes_processed": bytes_processed
+                }
+                self.tasks[task_id]["update_time"] = time.time()
+                if self.tasks[task_id]["status"] == "queued" and percentage > 0:
+                    self.tasks[task_id]["status"] = "running"
+
+    def set_pid(self, task_id, pid):
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id]["pid"] = pid
+
+    def append_output(self, task_id, stdout="", stderr=""):
+        with self.lock:
+            if task_id in self.tasks:
+                if stdout:
+                    self.tasks[task_id]["stdout"] += stdout
+                if stderr:
+                    self.tasks[task_id]["stderr"] += stderr
+                self.tasks[task_id]["update_time"] = time.time()
+
+    def complete_task(self, task_id, result):
+        with self.lock:
+            if task_id in self.tasks:
+                task = self.tasks[task_id]
+                task["status"] = "completed"
+                task["result"] = result
+                task["progress"]["percentage"] = 100.0
+                task["progress"]["current_step"] = "completed"
+                task["progress"]["message"] = f"Completed in {time.time() - task['start_time']:.1f}s"
+                task["update_time"] = time.time()
+                elapsed = time.time() - task["start_time"]
+                logger.info(f"✅ AsyncTaskManager: task {task_id} completed in {elapsed:.1f}s")
+
+    def fail_task(self, task_id, error):
+        with self.lock:
+            if task_id in self.tasks:
+                self.tasks[task_id]["status"] = "failed"
+                self.tasks[task_id]["error"] = error
+                self.tasks[task_id]["progress"]["current_step"] = "failed"
+                self.tasks[task_id]["progress"]["message"] = f"Failed: {error}"
+                self.tasks[task_id]["update_time"] = time.time()
+                logger.error(f"❌ AsyncTaskManager: task {task_id} failed — {error}")
+
+    def cancel_task(self, task_id):
+        with self.lock:
+            if task_id not in self.tasks:
+                return False
+            task = self.tasks[task_id]
+            if task["status"] in ("completed", "failed", "cancelled"):
+                return False
+            task["status"] = "cancelled"
+            task["progress"]["current_step"] = "cancelled"
+            task["progress"]["message"] = "Task cancelled by user"
+            task["update_time"] = time.time()
+            pid = task.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    logger.info(f"🛑 AsyncTaskManager: sent SIGTERM to PID {pid} for task {task_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to terminate PID {pid}: {e}")
+            logger.info(f"🛑 AsyncTaskManager: task {task_id} cancelled")
+            return True
+
+    def get_task(self, task_id):
+        with self.lock:
+            task = self.tasks.get(task_id)
+            return dict(task) if task else None
+
+    def list_tasks(self, status_filter=None):
+        with self.lock:
+            tasks = []
+            for task in self.tasks.values():
+                if status_filter and task["status"] != status_filter:
+                    continue
+                tasks.append({
+                    "task_id": task["task_id"],
+                    "tool": task["tool"],
+                    "target": task["target"],
+                    "status": task["status"],
+                    "progress": task["progress"],
+                    "start_time": task["start_time"],
+                    "update_time": task["update_time"],
+                    "elapsed": time.time() - task["start_time"],
+                    "pid": task.get("pid"),
+                    "error": task.get("error"),
+                })
+            return sorted(tasks, key=lambda x: x["start_time"], reverse=True)
+
+    def get_stats(self):
+        with self.lock:
+            stats = {"total": len(self.tasks), "queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
+            for task in self.tasks.values():
+                s = task["status"]
+                if s in stats:
+                    stats[s] += 1
+            return stats
+
+
+# Global async task manager instance
+async_task_manager = AsyncTaskManager()
+
+
+# ============================================================================
+# ASYNC TOOL RUNNER (v6.2 HELPER)
+# ============================================================================
+
+def run_tool_async(task_id, tool_name, command, params=None, timeout=None):
+    """通用异步工具执行器 — 在后台线程中执行命令，实时更新进度"""
+    from subprocess import Popen, PIPE
+
+    if params is None:
+        params = {}
+    if timeout is None:
+        timeout = COMMAND_TIMEOUT
+
+    target = params.get("target", params.get("url", params.get("domain", "unknown")))
+
+    try:
+        async_task_manager.update_progress(task_id, 5, "starting", f"Executing {tool_name} on {target}")
+
+        process = Popen(command, shell=True, stdout=PIPE, stderr=PIPE,
+                       text=True, bufsize=1, universal_newlines=True)
+        async_task_manager.set_pid(task_id, process.pid)
+
+        start_time = time.time()
+        stdout_buf = []
+        stderr_buf = []
+
+        def read_pipe(pipe, buf, max_lines=10000):
+            try:
+                for line in iter(pipe.readline, ""):
+                    if line:
+                        buf.append(line)
+                        if len(buf) > max_lines:
+                            del buf[:-max_lines]
+            except Exception:
+                pass
+
+        stdout_thread = threading.Thread(target=read_pipe, args=(process.stdout, stdout_buf), daemon=True)
+        stderr_thread = threading.Thread(target=read_pipe, args=(process.stderr, stderr_buf), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        last_progress_update = time.time()
+        while process.poll() is None:
+            elapsed = time.time() - start_time
+
+            # 超时处理
+            if elapsed > timeout:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    process.kill()
+
+                stdout = "".join(stdout_buf)
+                stderr = "".join(stderr_buf)
+                async_task_manager.append_output(task_id, stdout=stdout, stderr=stderr)
+
+                result = {
+                    "success": False, "error": f"Command timed out after {elapsed:.0f}s",
+                    "timed_out": True, "partial_results": bool(stdout or stderr),
+                    "stdout": stdout[-50000:], "stderr": stderr[-10000:],
+                    "execution_time": elapsed, "return_code": -1, "tool": tool_name, "target": target
+                }
+                async_task_manager.fail_task(task_id, result["error"])
+                return
+
+            # 每 2 秒更新一次进度
+            if time.time() - last_progress_update >= 2:
+                progress = min(95.0, (elapsed / timeout) * 80 + 5)
+                total_output = sum(len(l) for l in stdout_buf) + sum(len(l) for l in stderr_buf)
+                async_task_manager.update_progress(task_id, progress, "processing",
+                    f"Running {elapsed:.0f}s | {len(stdout_buf)} lines output", total_output)
+                last_progress_update = time.time()
+
+            time.sleep(0.5)
+
+        # 进程结束
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+
+        elapsed = time.time() - start_time
+        stdout = "".join(stdout_buf)
+        stderr = "".join(stderr_buf)
+        return_code = process.returncode
+
+        async_task_manager.append_output(task_id, stdout=stdout, stderr=stderr)
+
+        success = (return_code == 0) or (stdout or stderr)
+        result = {
+            "success": success, "stdout": stdout, "stderr": stderr,
+            "return_code": return_code, "execution_time": elapsed,
+            "timed_out": False, "partial_results": not success and (stdout or stderr),
+            "tool": tool_name, "target": target
+        }
+        async_task_manager.complete_task(task_id, result)
+
+    except Exception as e:
+        error_msg = f"Async execution error: {str(e)}"
+        logger.error(f"❌ Async task {task_id} error: {error_msg}")
+        async_task_manager.fail_task(task_id, error_msg)
+
+
 class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
 
@@ -9040,7 +9317,7 @@ def health_check():
     ]
 
     vuln_scanning_tools = [
-        "nuclei", "wpscan", "graphql-scanner", "jwt-analyzer"
+        "nuclei", "wpscan"
     ]
 
     password_tools = [
@@ -9049,7 +9326,7 @@ def health_check():
 
     binary_tools = [
         "gdb", "radare2", "binwalk", "ropgadget", "checksec", "objdump",
-        "ghidra", "pwntools", "one-gadget", "ropper", "angr", "libc-database",
+        "ghidra", "one-gadget", "ropper", "angr", "libc-database",
         "pwninit"
     ]
 
@@ -9066,16 +9343,16 @@ def health_check():
 
     osint_tools = [
         "amass", "subfinder", "fierce", "dnsenum", "theharvester", "sherlock",
-        "social-analyzer", "recon-ng", "maltego", "spiderfoot", "shodan-cli",
+        "social-analyzer", "recon-ng", "maltego", "spiderfoot", "shodan",
         "censys-cli", "have-i-been-pwned"
     ]
 
     exploitation_tools = [
-        "metasploit", "exploit-db", "searchsploit"
+        "msfconsole", "exploit-db", "searchsploit"
     ]
 
     api_tools = [
-        "api-schema-analyzer", "postman", "insomnia", "curl", "httpie", "anew", "qsreplace", "uro"
+        "api-schema-analyzer", "curl", "httpie", "anew", "qsreplace", "uro"
     ]
 
     wireless_tools = [
@@ -9085,7 +9362,7 @@ def health_check():
     additional_tools = [
         "smbmap", "volatility", "sleuthkit", "autopsy", "evil-winrm",
         "paramspider", "airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng",
-        "msfvenom", "msfconsole", "graphql-scanner", "jwt-analyzer"
+        "msfvenom", "pwntools", "jwt-analyzer", "graphql-scanner"
     ]
 
     all_tools = (
@@ -9097,8 +9374,52 @@ def health_check():
 
     for tool in all_tools:
         try:
-            result = execute_command(f"which {tool}", use_cache=True)
-            tools_status[tool] = result["success"]
+            if tool == "pwntools":
+                # Python library in /tools/tools-venv
+                result = execute_command("/tools/tools-venv/bin/python3 -c \"from pwn import *\"", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "jwt-analyzer":
+                # PyJWT + custom analysis, check if the venv has jwt module
+                result = execute_command("/tools/tools-venv/bin/python3 -c \"import jwt\"", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "graphql-scanner":
+                # Custom script at /tools/graphql-scanner/scan.py
+                result = execute_command("test -f /tools/graphql-scanner/scan.py && test -x /tools/graphql-scanner/graphql-venv/bin/python3 || test -f /tools/graphql-scanner/graphql-venv/bin/python3", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "shodan":
+                result = execute_command("which shodan", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "httpie":
+                # httpie in /tools/tools-venv, entry point is 'http' command
+                result = execute_command("/tools/tools-venv/bin/http --version", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "uro":
+                # uro in /tools/tools-venv
+                result = execute_command("/tools/tools-venv/bin/uro --help", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "qsreplace":
+                # qsreplace direct command
+                result = execute_command("which qsreplace", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "prowler":
+                # prowler in /tools/tools-venv (pydantic compat issue with --version)
+                result = execute_command("test -f /tools/tools-venv/bin/prowler", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "kube-hunter":
+                # kube-hunter in /tools/tools-venv (no --version flag, use --list)
+                result = execute_command("/tools/tools-venv/bin/kube-hunter --list >/dev/null 2>&1", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "checkov":
+                # checkov in /tools/tools-venv
+                result = execute_command("/tools/tools-venv/bin/checkov --version", use_cache=True)
+                tools_status[tool] = result["success"]
+            elif tool == "terrascan":
+                # terrascan via go install in /usr/local/bin
+                result = execute_command("which terrascan", use_cache=True)
+                tools_status[tool] = result["success"]
+            else:
+                result = execute_command(f"which {tool}", use_cache=True)
+                tools_status[tool] = result["success"]
         except:
             tools_status[tool] = False
 
@@ -10321,12 +10642,81 @@ def create_comprehensive_bugbounty_assessment():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 # ============================================================================
+# ASYNC TASK MANAGEMENT API (v6.2 ENHANCEMENT)
+# ============================================================================
+
+@app.route("/api/tasks", methods=["GET"])
+def list_async_tasks():
+    """列出所有异步任务"""
+    try:
+        status_filter = request.args.get("status")
+        tasks = async_task_manager.list_tasks(status_filter)
+        stats = async_task_manager.get_stats()
+        return jsonify({"success": True, "stats": stats, "tasks": tasks, "count": len(tasks)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/tasks/<task_id>", methods=["GET"])
+def get_task_status(task_id):
+    """获取指定任务的详细状态"""
+    try:
+        task = async_task_manager.get_task(task_id)
+        if not task:
+            return jsonify({"success": False, "error": f"Task {task_id} not found", "status": "not_found"}), 404
+
+        if task["status"] == "completed":
+            return jsonify({
+                "success": True, "task_id": task_id, "tool": task["tool"], "target": task["target"],
+                "status": "completed", "progress": task["progress"],
+                "start_time": task["start_time"], "update_time": task["update_time"],
+                "elapsed": time.time() - task["start_time"],
+                "result": task["result"],
+                "stdout": task.get("stdout", ""), "stderr": task.get("stderr", "")
+            })
+        elif task["status"] == "failed":
+            return jsonify({
+                "success": False, "task_id": task_id, "tool": task["tool"], "target": task["target"],
+                "status": "failed", "error": task["error"],
+                "progress": task["progress"], "elapsed": time.time() - task["start_time"],
+                "stdout": task.get("stdout", ""), "stderr": task.get("stderr", "")
+            })
+        else:
+            return jsonify({
+                "success": True, "task_id": task_id, "tool": task["tool"], "target": task["target"],
+                "status": task["status"], "progress": task["progress"],
+                "start_time": task["start_time"], "update_time": task["update_time"],
+                "elapsed": time.time() - task["start_time"], "pid": task.get("pid"),
+                "partial_stdout": task.get("stdout", "")[-2000:] if task.get("stdout") else "",
+                "partial_stderr": task.get("stderr", "")[-2000:] if task.get("stderr") else ""
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/tasks/<task_id>/cancel", methods=["POST"])
+def cancel_async_task(task_id):
+    """取消运行中的任务"""
+    try:
+        success = async_task_manager.cancel_task(task_id)
+        if success:
+            return jsonify({"success": True, "task_id": task_id, "status": "cancelled", "message": "Task cancelled"})
+        else:
+            return jsonify({"success": False, "task_id": task_id, "message": "Task not found or already completed"}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/tasks/stats", methods=["GET"])
+def task_stats():
+    """获取任务统计信息"""
+    stats = async_task_manager.get_stats()
+    return jsonify({"success": True, "stats": stats})
+
+# ============================================================================
 # SECURITY TOOLS API ENDPOINTS
 # ============================================================================
 
 @app.route("/api/tools/nmap", methods=["POST"])
 def nmap():
-    """Execute nmap scan with enhanced logging, caching, and intelligent error handling"""
+    """Execute nmap scan with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
@@ -10334,32 +10724,43 @@ def nmap():
         ports = params.get("ports", "")
         additional_args = params.get("additional_args", "-T4 -Pn")
         use_recovery = params.get("use_recovery", True)
+        async_mode = params.get("async", False)
 
         if not target:
             logger.warning("🎯 Nmap called without target parameter")
-            return jsonify({
-                "error": "Target parameter is required"
-            }), 400
+            return jsonify({"error": "Target parameter is required"}), 400
 
         command = f"nmap {scan_type}"
-
         if ports:
             command += f" -p {ports}"
-
         if additional_args:
             command += f" {additional_args}"
-
         command += f" {target}"
 
-        logger.info(f"🔍 Starting Nmap scan: {target}")
+        # --- ASYNC MODE ---
+        if async_mode:
+            task_id = async_task_manager.create_task("nmap", target, params)
+            thread = threading.Thread(
+                target=run_tool_async,
+                args=(task_id, "nmap", command, params),
+                daemon=True
+            )
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "nmap", "target": target,
+                "message": f"Nmap scan submitted for {target}",
+                "poll_endpoint": f"/api/tasks/{task_id}",
+                "cancel_endpoint": f"/api/tasks/{task_id}/cancel",
+                "estimated_time": "60-300s depending on target"
+            })
 
-        # Use intelligent error handling if enabled
+        # --- SYNC MODE (backward compatible) ---
+        logger.info(f"🔍 Starting Nmap scan (sync): {target}")
         if use_recovery:
             tool_params = {
-                "target": target,
-                "scan_type": scan_type,
-                "ports": ports,
-                "additional_args": additional_args
+                "target": target, "scan_type": scan_type,
+                "ports": ports, "additional_args": additional_args
             }
             result = execute_command_with_recovery("nmap", command, tool_params)
         else:
@@ -10370,13 +10771,11 @@ def nmap():
 
     except Exception as e:
         logger.error(f"💥 Error in nmap endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/gobuster", methods=["POST"])
 def gobuster():
-    """Execute gobuster with enhanced logging and intelligent error handling"""
+    """Execute gobuster with async support (v6.2 enhancement)"""
     try:
         params = request.json
         url = params.get("url", "")
@@ -10384,51 +10783,46 @@ def gobuster():
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
         additional_args = params.get("additional_args", "")
         use_recovery = params.get("use_recovery", True)
+        async_mode = params.get("async", False)
 
         if not url:
-            logger.warning("🌐 Gobuster called without URL parameter")
-            return jsonify({
-                "error": "URL parameter is required"
-            }), 400
-
-        # Validate mode
+            return jsonify({"error": "URL parameter is required"}), 400
         if mode not in ["dir", "dns", "fuzz", "vhost"]:
-            logger.warning(f"❌ Invalid gobuster mode: {mode}")
-            return jsonify({
-                "error": f"Invalid mode: {mode}. Must be one of: dir, dns, fuzz, vhost"
-            }), 400
+            return jsonify({"error": f"Invalid mode: {mode}. Must be one of: dir, dns, fuzz, vhost"}), 400
 
         command = f"gobuster {mode} -u {url} -w {wordlist}"
-
         if additional_args:
             command += f" {additional_args}"
 
-        logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
+        # --- ASYNC MODE ---
+        if async_mode:
+            task_id = async_task_manager.create_task("gobuster", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "gobuster", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "gobuster", "target": url,
+                "message": f"Gobuster {mode} scan submitted for {url}",
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
-        # Use intelligent error handling if enabled
+        # --- SYNC MODE ---
+        logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
         if use_recovery:
-            tool_params = {
-                "target": url,
-                "mode": mode,
-                "wordlist": wordlist,
-                "additional_args": additional_args
-            }
+            tool_params = {"target": url, "mode": mode, "wordlist": wordlist}
             result = execute_command_with_recovery("gobuster", command, tool_params)
         else:
             result = execute_command(command)
-
-        logger.info(f"📊 Gobuster scan completed for {url}")
         return jsonify(result)
 
     except Exception as e:
         logger.error(f"💥 Error in gobuster endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/nuclei", methods=["POST"])
 def nuclei():
-    """Execute Nuclei vulnerability scanner with enhanced logging and intelligent error handling"""
+    """Execute Nuclei vulnerability scanner with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
@@ -10437,50 +10831,46 @@ def nuclei():
         template = params.get("template", "")
         additional_args = params.get("additional_args", "")
         use_recovery = params.get("use_recovery", True)
+        async_mode = params.get("async", False)
 
         if not target:
-            logger.warning("🎯 Nuclei called without target parameter")
-            return jsonify({
-                "error": "Target parameter is required"
-            }), 400
+            return jsonify({"error": "Target parameter is required"}), 400
 
         command = f"nuclei -u {target}"
-
         if severity:
             command += f" -severity {severity}"
-
         if tags:
             command += f" -tags {tags}"
-
         if template:
             command += f" -t {template}"
-
         if additional_args:
             command += f" {additional_args}"
 
-        logger.info(f"🔬 Starting Nuclei vulnerability scan: {target}")
+        # --- ASYNC MODE ---
+        if async_mode:
+            task_id = async_task_manager.create_task("nuclei", target, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "nuclei", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "nuclei", "target": target,
+                "message": f"Nuclei scan submitted for {target}",
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
-        # Use intelligent error handling if enabled
+        # --- SYNC MODE ---
+        logger.info(f"🔬 Starting Nuclei scan: {target}")
         if use_recovery:
-            tool_params = {
-                "target": target,
-                "severity": severity,
-                "tags": tags,
-                "template": template,
-                "additional_args": additional_args
-            }
+            tool_params = {"target": target, "severity": severity, "tags": tags, "template": template}
             result = execute_command_with_recovery("nuclei", command, tool_params)
         else:
             result = execute_command(command)
-
-        logger.info(f"📊 Nuclei scan completed for {target}")
         return jsonify(result)
 
     except Exception as e:
         logger.error(f"💥 Error in nuclei endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 # ============================================================================
 # CLOUD SECURITY TOOLS
@@ -10502,7 +10892,7 @@ def prowler():
         # Ensure output directory exists
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        command = f"prowler {provider}"
+        command = f"/tools/tools-venv/bin/prowler {provider}"
 
         if profile:
             command += f" --profile {profile}"
@@ -10519,6 +10909,18 @@ def prowler():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("prowler", params.get("provider", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "prowler", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "prowler", "target": params.get("provider", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting Prowler {provider} security assessment")
         result = execute_command(command)
         result["output_directory"] = output_dir
@@ -10562,6 +10964,18 @@ def trivy():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("trivy", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "trivy", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "trivy", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Trivy {scan_type} scan: {target}")
         result = execute_command(command)
         if output_file:
@@ -10609,6 +11023,18 @@ def scout_suite():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("scout-suite", params.get("provider", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "scout-suite", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "scout-suite", "target": params.get("provider", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting Scout Suite {provider} assessment")
         result = execute_command(command)
         result["report_directory"] = report_dir
@@ -10643,6 +11069,18 @@ def cloudmapper():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("cloudmapper", params.get("account", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "cloudmapper", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "cloudmapper", "target": params.get("account", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting CloudMapper {action}")
         result = execute_command(command)
         logger.info(f"📊 CloudMapper {action} completed")
@@ -10688,6 +11126,18 @@ def pacu():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("pacu", params.get("profile", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "pacu", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "pacu", "target": params.get("profile", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting Pacu AWS exploitation")
         result = execute_command(command)
 
@@ -10716,7 +11166,7 @@ def kube_hunter():
         report = params.get("report", "json")
         additional_args = params.get("additional_args", "")
 
-        command = "kube-hunter"
+        command = "/tools/tools-venv/bin/kube-hunter"
 
         if target:
             command += f" --remote {target}"
@@ -10739,6 +11189,18 @@ def kube_hunter():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("kube-hunter", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "kube-hunter", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "kube-hunter", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting kube-hunter Kubernetes scan")
         result = execute_command(command)
         logger.info(f"📊 kube-hunter scan completed")
@@ -10775,6 +11237,18 @@ def kube_bench():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("kube-bench", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "kube-bench", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "kube-bench", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"☁️  Starting kube-bench CIS benchmark")
         result = execute_command(command)
         logger.info(f"📊 kube-bench benchmark completed")
@@ -10807,6 +11281,18 @@ def docker_bench_security():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("docker-bench-security", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "docker-bench-security", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "docker-bench-security", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🐳 Starting Docker Bench Security assessment")
         result = execute_command(command)
         result["output_file"] = output_file
@@ -10842,6 +11328,18 @@ def clair():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("clair", params.get("image", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "clair", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "clair", "target": params.get("image", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🐳 Starting Clair vulnerability scan: {image}")
         result = execute_command(command)
         logger.info(f"📊 Clair scan completed for {image}")
@@ -10875,6 +11373,18 @@ def falco():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("falco", params.get("config", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "falco", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "falco", "target": params.get("config", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🛡️  Starting Falco runtime monitoring for {duration}s")
         result = execute_command(command)
         logger.info(f"📊 Falco monitoring completed")
@@ -10895,7 +11405,7 @@ def checkov():
         output_format = params.get("output_format", "json")
         additional_args = params.get("additional_args", "")
 
-        command = f"checkov -d {directory}"
+        command = f"/tools/tools-venv/bin/checkov -d {directory}"
 
         if framework:
             command += f" --framework {framework}"
@@ -10912,6 +11422,18 @@ def checkov():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("checkov", params.get("directory", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "checkov", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "checkov", "target": params.get("directory", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Checkov IaC scan: {directory}")
         result = execute_command(command)
         logger.info(f"📊 Checkov scan completed")
@@ -10946,6 +11468,18 @@ def terrascan():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("terrascan", params.get("iac_dir", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "terrascan", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "terrascan", "target": params.get("iac_dir", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Terrascan IaC scan: {iac_dir}")
         result = execute_command(command)
         logger.info(f"📊 Terrascan scan completed")
@@ -10974,6 +11508,18 @@ def dirb():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("dirb", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "dirb", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "dirb", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"📁 Starting Dirb scan: {url}")
         result = execute_command(command)
         logger.info(f"📊 Dirb scan completed for {url}")
@@ -10986,55 +11532,67 @@ def dirb():
 
 @app.route("/api/tools/nikto", methods=["POST"])
 def nikto():
-    """Execute nikto with enhanced logging"""
+    """Execute nikto with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not target:
-            logger.warning("🎯 Nikto called without target parameter")
-            return jsonify({
-                "error": "Target parameter is required"
-            }), 400
+            return jsonify({"error": "Target parameter is required"}), 400
 
         command = f"nikto -h {target}"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("nikto", target, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "nikto", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "nikto", "target": target,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"🔬 Starting Nikto scan: {target}")
         result = execute_command(command)
-        logger.info(f"📊 Nikto scan completed for {target}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in nikto endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/sqlmap", methods=["POST"])
 def sqlmap():
-    """Execute sqlmap with enhanced logging"""
+    """Execute sqlmap with async support (v6.2 enhancement)"""
     try:
         params = request.json
         url = params.get("url", "")
         data = params.get("data", "")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not url:
-            logger.warning("🎯 SQLMap called without URL parameter")
-            return jsonify({
-                "error": "URL parameter is required"
-            }), 400
+            return jsonify({"error": "URL parameter is required"}), 400
 
         command = f"sqlmap -u {url} --batch"
-
         if data:
             command += f" --data=\"{data}\""
-
         if additional_args:
             command += f" {additional_args}"
+
+        if async_mode:
+            task_id = async_task_manager.create_task("sqlmap", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "sqlmap", command, params, 1800), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "sqlmap", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
         logger.info(f"💉 Starting SQLMap scan: {url}")
         result = execute_command(command)
@@ -11073,6 +11631,18 @@ def metasploit():
 
         command = f"msfconsole -q -r {resource_file}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("metasploit", params.get("module", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "metasploit", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "metasploit", "target": params.get("module", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🚀 Starting Metasploit module: {module}")
         result = execute_command(command)
 
@@ -11092,7 +11662,7 @@ def metasploit():
 
 @app.route("/api/tools/hydra", methods=["POST"])
 def hydra():
-    """Execute hydra with enhanced logging"""
+    """Execute hydra with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
@@ -11102,45 +11672,43 @@ def hydra():
         password = params.get("password", "")
         password_file = params.get("password_file", "")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not target or not service:
-            logger.warning("🎯 Hydra called without target or service parameter")
-            return jsonify({
-                "error": "Target and service parameters are required"
-            }), 400
-
+            return jsonify({"error": "Target and service parameters are required"}), 400
         if not (username or username_file) or not (password or password_file):
-            logger.warning("🔑 Hydra called without username/password parameters")
-            return jsonify({
-                "error": "Username/username_file and password/password_file are required"
-            }), 400
+            return jsonify({"error": "Username/username_file and password/password_file are required"}), 400
 
         command = f"hydra -t 4"
-
         if username:
             command += f" -l {username}"
         elif username_file:
             command += f" -L {username_file}"
-
         if password:
             command += f" -p {password}"
         elif password_file:
             command += f" -P {password_file}"
-
         if additional_args:
             command += f" {additional_args}"
-
         command += f" {target} {service}"
+
+        if async_mode:
+            task_id = async_task_manager.create_task("hydra", f"{target}:{service}", params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "hydra", command, params, 3600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "hydra", "target": f"{target}:{service}",
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
         logger.info(f"🔑 Starting Hydra attack: {target}:{service}")
         result = execute_command(command)
-        logger.info(f"📊 Hydra attack completed for {target}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in hydra endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/john", methods=["POST"])
 def john():
@@ -11171,6 +11739,18 @@ def john():
 
         command += f" {hash_file}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("john", params.get("hash_file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "john", command, params, 3600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "john", "target": params.get("hash_file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔐 Starting John the Ripper: {hash_file}")
         result = execute_command(command)
         logger.info(f"📊 John the Ripper completed")
@@ -11200,15 +11780,23 @@ def wpscan():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+        if async_mode:
+            task_id = async_task_manager.create_task("wpscan", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "wpscan", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "wpscan", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting WPScan: {url}")
         result = execute_command(command)
-        logger.info(f"📊 WPScan completed for {url}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in wpscan endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/enum4linux", methods=["POST"])
 def enum4linux():
@@ -11226,6 +11814,18 @@ def enum4linux():
 
         command = f"enum4linux {additional_args} {target}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("enum4linux", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "enum4linux", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "enum4linux", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Enum4linux: {target}")
         result = execute_command(command)
         logger.info(f"📊 Enum4linux completed for {target}")
@@ -11238,7 +11838,7 @@ def enum4linux():
 
 @app.route("/api/tools/ffuf", methods=["POST"])
 def ffuf():
-    """Execute FFuf web fuzzer with enhanced logging"""
+    """Execute FFuf web fuzzer with async support (v6.2 enhancement)"""
     try:
         params = request.json
         url = params.get("url", "")
@@ -11246,15 +11846,12 @@ def ffuf():
         mode = params.get("mode", "directory")
         match_codes = params.get("match_codes", "200,204,301,302,307,401,403")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not url:
-            logger.warning("🌐 FFuf called without URL parameter")
-            return jsonify({
-                "error": "URL parameter is required"
-            }), 400
+            return jsonify({"error": "URL parameter is required"}), 400
 
         command = f"ffuf"
-
         if mode == "directory":
             command += f" -u {url}/FUZZ -w {wordlist}"
         elif mode == "vhost":
@@ -11263,21 +11860,27 @@ def ffuf():
             command += f" -u {url}?FUZZ=value -w {wordlist}"
         else:
             command += f" -u {url} -w {wordlist}"
-
         command += f" -mc {match_codes}"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("ffuf", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "ffuf", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "ffuf", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"🔍 Starting FFuf {mode} fuzzing: {url}")
         result = execute_command(command)
-        logger.info(f"📊 FFuf fuzzing completed for {url}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in ffuf endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/netexec", methods=["POST"])
 def netexec():
@@ -11315,6 +11918,18 @@ def netexec():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("netexec", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "netexec", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "netexec", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting NetExec {protocol} scan: {target}")
         result = execute_command(command)
         logger.info(f"📊 NetExec scan completed for {target}")
@@ -11327,28 +11942,31 @@ def netexec():
 
 @app.route("/api/tools/amass", methods=["POST"])
 def amass():
-    """Execute Amass for subdomain enumeration with enhanced logging"""
+    """Execute Amass for subdomain enumeration with async support (v6.2 enhancement)"""
     try:
         params = request.json
         domain = params.get("domain", "")
         mode = params.get("mode", "enum")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not domain:
-            logger.warning("🌐 Amass called without domain parameter")
-            return jsonify({
-                "error": "Domain parameter is required"
-            }), 400
+            return jsonify({"error": "Domain parameter is required"}), 400
 
-        command = f"amass {mode}"
-
-        if mode == "enum":
-            command += f" -d {domain}"
-        else:
-            command += f" -d {domain}"
-
+        command = f"amass {mode} -d {domain}"
         if additional_args:
             command += f" {additional_args}"
+
+        if async_mode:
+            task_id = async_task_manager.create_task("amass", domain, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "amass", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "amass", "target": domain,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
         logger.info(f"🔍 Starting Amass {mode}: {domain}")
         result = execute_command(command)
@@ -11359,6 +11977,80 @@ def amass():
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
+
+@app.route("/api/tools/shodan_search", methods=["POST"])
+def shodan_search():
+    """Execute Shodan CLI for host/internet search"""
+    try:
+        params = request.json
+        query = params.get("query", "")
+        host = params.get("host", "")
+
+        if not query and not host:
+            return jsonify({"error": "Query or host parameter is required"}), 400
+
+        if host:
+            command = f"shodan host {host}"
+        else:
+            command = f"shodan search \"{query}\""
+
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("shodan_search", host or query, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "shodan_search", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "shodan_search", "target": host or query,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
+        logger.info(f"🔍 Starting Shodan search: {host or query}")
+        result = execute_command(command, use_cache=False)
+        logger.info(f"📊 Shodan search completed")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in shodan_search endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route("/api/tools/censys_search", methods=["POST"])
+def censys_search():
+    """Execute Censys CLI for host/search queries"""
+    try:
+        params = request.json
+        query = params.get("query", "")
+        host = params.get("host", "")
+
+        if not query and not host:
+            return jsonify({"error": "Query or host parameter is required"}), 400
+
+        if host:
+            command = f"censys view {host}"
+        else:
+            command = f"censys search \"{query}\""
+
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("censys_search", host or query, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "censys_search", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "censys_search", "target": host or query,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
+        logger.info(f"🔍 Starting Censys search: {host or query}")
+        result = execute_command(command, use_cache=False)
+        logger.info(f"📊 Censys search completed")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in censys_search endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/hashcat", methods=["POST"])
 def hashcat():
@@ -11394,6 +12086,18 @@ def hashcat():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("hashcat", params.get("hash_file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "hashcat", command, params, 3600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "hashcat", "target": params.get("hash_file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔐 Starting Hashcat attack: mode {attack_mode}")
         result = execute_command(command)
         logger.info(f"📊 Hashcat attack completed")
@@ -11413,33 +12117,36 @@ def subfinder():
         silent = params.get("silent", True)
         all_sources = params.get("all_sources", False)
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not domain:
-            logger.warning("🌐 Subfinder called without domain parameter")
-            return jsonify({
-                "error": "Domain parameter is required"
-            }), 400
+            return jsonify({"error": "Domain parameter is required"}), 400
 
         command = f"subfinder -d {domain}"
-
         if silent:
             command += " -silent"
-
         if all_sources:
             command += " -all"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("subfinder", domain, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "subfinder", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "subfinder", "target": domain,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"🔍 Starting Subfinder: {domain}")
         result = execute_command(command)
-        logger.info(f"📊 Subfinder completed for {domain}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in subfinder endpoint: {str(e)}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/smbmap", methods=["POST"])
 def smbmap():
@@ -11472,6 +12179,18 @@ def smbmap():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("smbmap", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "smbmap", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "smbmap", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting SMBMap: {target}")
         result = execute_command(command)
         logger.info(f"📊 SMBMap completed for {target}")
@@ -11488,35 +12207,42 @@ def smbmap():
 
 @app.route("/api/tools/rustscan", methods=["POST"])
 def rustscan():
-    """Execute Rustscan for ultra-fast port scanning with enhanced logging"""
+    """Execute Rustscan for ultra-fast port scanning with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
         ports = params.get("ports", "")
         ulimit = params.get("ulimit", 5000)
         batch_size = params.get("batch_size", 4500)
-        timeout = params.get("timeout", 1500)
+        timeout_val = params.get("timeout", 1500)
         scripts = params.get("scripts", "")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not target:
-            logger.warning("🎯 Rustscan called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"rustscan -a {target} --ulimit {ulimit} -b {batch_size} -t {timeout}"
-
+        command = f"rustscan -a {target} --ulimit {ulimit} -b {batch_size} -t {timeout_val}"
         if ports:
             command += f" -p {ports}"
-
         if scripts:
             command += f" -- -sC -sV"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("rustscan", target, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "rustscan", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "rustscan", "target": target,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"⚡ Starting Rustscan: {target}")
         result = execute_command(command)
-        logger.info(f"📊 Rustscan completed for {target}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in rustscan endpoint: {str(e)}")
@@ -11524,7 +12250,7 @@ def rustscan():
 
 @app.route("/api/tools/masscan", methods=["POST"])
 def masscan():
-    """Execute Masscan for high-speed Internet-scale port scanning with intelligent rate limiting"""
+    """Execute Masscan for high-speed Internet-scale port scanning with async support (v6.2 enhancement)"""
     try:
         params = request.json
         target = params.get("target", "")
@@ -11535,34 +12261,73 @@ def masscan():
         source_ip = params.get("source_ip", "")
         banners = params.get("banners", False)
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not target:
-            logger.warning("🎯 Masscan called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
         command = f"masscan {target} -p{ports} --rate={rate}"
-
         if interface:
             command += f" -e {interface}"
-
         if router_mac:
             command += f" --router-mac {router_mac}"
-
         if source_ip:
             command += f" --source-ip {source_ip}"
-
         if banners:
             command += " --banners"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("masscan", target, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "masscan", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "masscan", "target": target,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"🚀 Starting Masscan: {target} at rate {rate}")
         result = execute_command(command)
-        logger.info(f"📊 Masscan completed for {target}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in masscan endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route("/api/tools/file", methods=["POST"])
+def file_type():
+    """Execute file type identification with async support (v6.2 enhancement)"""
+    try:
+        params = request.json
+        target = params.get("target", "")
+        additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
+
+        if not target:
+            return jsonify({"error": "Target parameter is required"}), 400
+
+        command = f"file {target}"
+        if additional_args:
+            command += f" {additional_args}"
+
+        if async_mode:
+            task_id = async_task_manager.create_task("file", target, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "file", command, params, 30), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "file", "target": target,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
+        logger.info(f"📁 Starting file type identification: {target}")
+        result = execute_command(command)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in file endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/nmap-advanced", methods=["POST"])
@@ -11612,6 +12377,18 @@ def nmap_advanced():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("nmap-advanced", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "nmap-advanced", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "nmap-advanced", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Advanced Nmap: {target}")
         result = execute_command(command)
         logger.info(f"📊 Advanced Nmap completed for {target}")
@@ -11648,6 +12425,18 @@ def autorecon():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("autorecon", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "autorecon", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "autorecon", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔄 Starting AutoRecon: {target}")
         result = execute_command(command)
         logger.info(f"📊 AutoRecon completed for {target}")
@@ -11703,6 +12492,18 @@ def enum4linux_ng():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("enum4linux-ng", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "enum4linux-ng", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "enum4linux-ng", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Enum4linux-ng: {target}")
         result = execute_command(command)
         logger.info(f"📊 Enum4linux-ng completed for {target}")
@@ -11747,6 +12548,18 @@ def rpcclient():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("rpcclient", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "rpcclient", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "rpcclient", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting rpcclient: {target}")
         result = execute_command(command)
         logger.info(f"📊 rpcclient completed for {target}")
@@ -11779,6 +12592,18 @@ def nbtscan():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("nbtscan", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "nbtscan", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "nbtscan", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting nbtscan: {target}")
         result = execute_command(command)
         logger.info(f"📊 nbtscan completed for {target}")
@@ -11816,6 +12641,18 @@ def arp_scan():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("arp-scan", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "arp-scan", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "arp-scan", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting arp-scan: {target if target else 'local network'}")
         result = execute_command(command)
         logger.info(f"📊 arp-scan completed")
@@ -11858,6 +12695,18 @@ def responder():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("responder", params.get("interface", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "responder", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "responder", "target": params.get("interface", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Responder on interface: {interface}")
         result = execute_command(command)
         logger.info(f"📊 Responder completed")
@@ -11898,6 +12747,18 @@ def volatility():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("volatility", params.get("mem_file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "volatility", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "volatility", "target": params.get("mem_file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🧠 Starting Volatility analysis: {plugin}")
         result = execute_command(command)
         logger.info(f"📊 Volatility analysis completed")
@@ -11943,6 +12804,18 @@ def msfvenom():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("msfvenom", params.get("payload", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "msfvenom", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "msfvenom", "target": params.get("payload", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🚀 Starting MSFVenom payload generation: {payload}")
         result = execute_command(command)
         logger.info(f"📊 MSFVenom payload generated")
@@ -11989,6 +12862,18 @@ def gdb():
 
         command += " -batch"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("gdb", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "gdb", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "gdb", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting GDB analysis: {binary}")
         result = execute_command(command)
 
@@ -12032,6 +12917,18 @@ def radare2():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("radare2", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "radare2", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "radare2", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Radare2 analysis: {binary}")
         result = execute_command(command)
 
@@ -12074,6 +12971,18 @@ def binwalk():
 
         command += f" {file_path}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("binwalk", params.get("file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "binwalk", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "binwalk", "target": params.get("file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Binwalk analysis: {file_path}")
         result = execute_command(command)
         logger.info(f"📊 Binwalk analysis completed for {file_path}")
@@ -12107,6 +13016,18 @@ def ropgadget():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("ropgadget", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "ropgadget", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "ropgadget", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting ROPgadget search: {binary}")
         result = execute_command(command)
         logger.info(f"📊 ROPgadget search completed for {binary}")
@@ -12132,6 +13053,18 @@ def checksec():
 
         command = f"checksec --file={binary}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("checksec", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "checksec", command, params, 60), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "checksec", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Checksec analysis: {binary}")
         result = execute_command(command)
         logger.info(f"📊 Checksec analysis completed for {binary}")
@@ -12168,6 +13101,18 @@ def xxd():
 
         command += f" {file_path}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("xxd", params.get("file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "xxd", command, params, 60), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "xxd", "target": params.get("file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting XXD hex dump: {file_path}")
         result = execute_command(command)
         logger.info(f"📊 XXD hex dump completed for {file_path}")
@@ -12200,6 +13145,18 @@ def strings():
 
         command += f" {file_path}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("strings", params.get("file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "strings", command, params, 60), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "strings", "target": params.get("file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Strings extraction: {file_path}")
         result = execute_command(command)
         logger.info(f"📊 Strings extraction completed for {file_path}")
@@ -12237,6 +13194,18 @@ def objdump():
 
         command += f" {binary}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("objdump", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "objdump", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "objdump", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Objdump analysis: {binary}")
         result = execute_command(command)
         logger.info(f"📊 Objdump analysis completed for {binary}")
@@ -12283,6 +13252,18 @@ def ghidra():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("ghidra", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "ghidra", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "ghidra", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting Ghidra analysis: {binary}")
         result = execute_command(command, timeout=analysis_timeout)
         logger.info(f"📊 Ghidra analysis completed for {binary}")
@@ -12346,10 +13327,26 @@ p.interactive()
             with open(script_file, "w") as f:
                 f.write(template)
 
-        command = f"python3 {script_file}"
+        # 直接使用虚拟环境的 python3 可执行文件（无需 activate）
+        venv_python = "/tools/tools-venv/bin/python3"
+        command = f"{venv_python} {script_file}"
 
         if additional_args:
             command += f" {additional_args}"
+
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("pwntools", target_binary or target_host or "unknown", params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "pwntools", command, params, 1800), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "pwntools",
+                "target": target_binary or target_host or "unknown",
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
 
         logger.info(f"🔧 Starting Pwntools exploit: {exploit_type}")
         result = execute_command(command)
@@ -12384,6 +13381,18 @@ def one_gadget():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("one-gadget", params.get("libc", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "one-gadget", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "one-gadget", "target": params.get("libc", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting one_gadget analysis: {libc_path}")
         result = execute_command(command)
         logger.info(f"📊 one_gadget analysis completed")
@@ -12425,6 +13434,18 @@ def libc_database():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("libc-database", params.get("libc", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "libc-database", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "libc-database", "target": params.get("libc", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting libc-database {action}: {symbols or libc_id}")
         result = execute_command(command)
         logger.info(f"📊 libc-database {action} completed")
@@ -12479,6 +13500,18 @@ quit
             command += f" {additional_args}"
 
         target_info = binary or f'PID {attach_pid}' or core_file
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("gdb-peda", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "gdb-peda", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "gdb-peda", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting GDB-PEDA analysis: {target_info}")
         result = execute_command(command)
 
@@ -12625,6 +13658,18 @@ def ropper():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("ropper", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "ropper", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "ropper", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting ropper analysis: {binary}")
         result = execute_command(command)
         logger.info(f"📊 ropper analysis completed")
@@ -12662,6 +13707,18 @@ def pwninit():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("pwninit", params.get("binary", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "pwninit", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "pwninit", "target": params.get("binary", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔧 Starting pwninit setup: {binary}")
         result = execute_command(command)
         logger.info(f"📊 pwninit setup completed")
@@ -12695,6 +13752,18 @@ def feroxbuster():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("feroxbuster", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "feroxbuster", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "feroxbuster", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Feroxbuster scan: {url}")
         result = execute_command(command)
         logger.info(f"📊 Feroxbuster scan completed for {url}")
@@ -12727,6 +13796,18 @@ def dotdotpwn():
 
         command += " -b"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("dotdotpwn", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "dotdotpwn", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "dotdotpwn", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting DotDotPwn scan: {target}")
         result = execute_command(command)
         logger.info(f"📊 DotDotPwn scan completed for {target}")
@@ -12760,6 +13841,18 @@ def xsser():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("xsser", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "xsser", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "xsser", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting XSSer scan: {url}")
         result = execute_command(command)
         logger.info(f"📊 XSSer scan completed for {url}")
@@ -12790,6 +13883,18 @@ def wfuzz():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("wfuzz", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "wfuzz", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "wfuzz", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Wfuzz scan: {url}")
         result = execute_command(command)
         logger.info(f"📊 Wfuzz scan completed for {url}")
@@ -12806,7 +13911,7 @@ def wfuzz():
 
 @app.route("/api/tools/dirsearch", methods=["POST"])
 def dirsearch():
-    """Execute Dirsearch for advanced directory and file discovery with enhanced logging"""
+    """Execute Dirsearch with async support (v6.2 enhancement)"""
     try:
         params = request.json
         url = params.get("url", "")
@@ -12815,22 +13920,30 @@ def dirsearch():
         threads = params.get("threads", 30)
         recursive = params.get("recursive", False)
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not url:
-            logger.warning("🌐 Dirsearch called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
         command = f"dirsearch -u {url} -e {extensions} -w {wordlist} -t {threads}"
-
         if recursive:
             command += " -r"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("dirsearch", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "dirsearch", command, params, 900), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "dirsearch", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"📁 Starting Dirsearch scan: {url}")
         result = execute_command(command)
-        logger.info(f"📊 Dirsearch scan completed for {url}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in dirsearch endpoint: {str(e)}")
@@ -12838,7 +13951,7 @@ def dirsearch():
 
 @app.route("/api/tools/katana", methods=["POST"])
 def katana():
-    """Execute Katana for next-generation crawling and spidering with enhanced logging"""
+    """Execute Katana with async support (v6.2 enhancement)"""
     try:
         params = request.json
         url = params.get("url", "")
@@ -12847,28 +13960,34 @@ def katana():
         form_extraction = params.get("form_extraction", True)
         output_format = params.get("output_format", "json")
         additional_args = params.get("additional_args", "")
+        async_mode = params.get("async", False)
 
         if not url:
-            logger.warning("🌐 Katana called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
         command = f"katana -u {url} -d {depth}"
-
         if js_crawl:
             command += " -jc"
-
         if form_extraction:
             command += " -fx"
-
         if output_format == "json":
             command += " -jsonl"
-
         if additional_args:
             command += f" {additional_args}"
 
+        if async_mode:
+            task_id = async_task_manager.create_task("katana", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "katana", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "katana", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"⚔️  Starting Katana crawl: {url}")
         result = execute_command(command)
-        logger.info(f"📊 Katana crawl completed for {url}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in katana endpoint: {str(e)}")
@@ -12903,6 +14022,18 @@ def gau():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("gau", params.get("domain", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "gau", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "gau", "target": params.get("domain", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"📡 Starting Gau URL discovery: {domain}")
         result = execute_command(command)
         logger.info(f"📊 Gau URL discovery completed for {domain}")
@@ -12936,6 +14067,18 @@ def waybackurls():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("waybackurls", params.get("domain", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "waybackurls", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "waybackurls", "target": params.get("domain", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🕰️  Starting Waybackurls discovery: {domain}")
         result = execute_command(command)
         logger.info(f"📊 Waybackurls discovery completed for {domain}")
@@ -12975,6 +14118,18 @@ def arjun():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("arjun", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "arjun", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "arjun", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🎯 Starting Arjun parameter discovery: {url}")
         result = execute_command(command)
         logger.info(f"📊 Arjun parameter discovery completed for {url}")
@@ -13009,6 +14164,18 @@ def paramspider():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("paramspider", params.get("domain", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "paramspider", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "paramspider", "target": params.get("domain", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🕷️  Starting ParamSpider mining: {domain}")
         result = execute_command(command)
         logger.info(f"📊 ParamSpider mining completed for {domain}")
@@ -13044,6 +14211,18 @@ def x8():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("x8", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "x8", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "x8", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting x8 parameter discovery: {url}")
         result = execute_command(command)
         logger.info(f"📊 x8 parameter discovery completed for {url}")
@@ -13079,6 +14258,18 @@ def jaeles():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("jaeles", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "jaeles", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "jaeles", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔬 Starting Jaeles vulnerability scan: {url}")
         result = execute_command(command)
         logger.info(f"📊 Jaeles vulnerability scan completed for {url}")
@@ -13124,6 +14315,18 @@ def dalfox():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("dalfox", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "dalfox", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "dalfox", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🎯 Starting Dalfox XSS scan: {url if url else 'pipe mode'}")
         result = execute_command(command)
         logger.info(f"📊 Dalfox XSS scan completed")
@@ -13174,6 +14377,18 @@ def httpx():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("httpx", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "httpx", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "httpx", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🌍 Starting httpx probe: {target}")
         result = execute_command(command)
         logger.info(f"📊 httpx probe completed for {target}")
@@ -13203,6 +14418,18 @@ def anew():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("anew", params.get("input", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "anew", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "anew", "target": params.get("input", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info("📝 Starting anew data processing")
         result = execute_command(command)
         logger.info("📊 anew data processing completed")
@@ -13229,6 +14456,18 @@ def qsreplace():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("qsreplace", params.get("input", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "qsreplace", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "qsreplace", "target": params.get("input", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info("🔄 Starting qsreplace parameter replacement")
         result = execute_command(command)
         logger.info("📊 qsreplace parameter replacement completed")
@@ -13251,7 +14490,7 @@ def uro():
             logger.warning("🌐 uro called without URLs")
             return jsonify({"error": "URLs parameter is required"}), 400
 
-        command = f"echo '{urls}' | uro"
+        command = f"echo '{urls}' | /tools/tools-venv/bin/uro"
 
         if whitelist:
             command += f" --whitelist {whitelist}"
@@ -13262,12 +14501,83 @@ def uro():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("uro", params.get("input", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "uro", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "uro", "target": params.get("input", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info("🔍 Starting uro URL filtering")
         result = execute_command(command)
         logger.info("📊 uro URL filtering completed")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in uro endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route("/api/tools/httpie", methods=["POST"])
+def httpie_tool():
+    """Execute httpie for HTTP request testing and API interaction"""
+    try:
+        params = request.json
+        url = params.get("url", "")
+        method = params.get("method", "GET").upper()
+        headers = params.get("headers", {})
+        body = params.get("body", "")
+        query_params = params.get("query_params", {})
+        additional_args = params.get("additional_args", "")
+
+        if not url:
+            logger.warning("🌐 httpie called without url parameter")
+            return jsonify({"error": "URL parameter is required"}), 400
+
+        venv_http = "/tools/tools-venv/bin/http"
+        command = f"{venv_http} {method.lower()} {url}"
+
+        if headers:
+            for k, v in headers.items():
+                command += f' "{k}:{v}"'
+
+        if body and isinstance(body, dict):
+            import json
+            json_body = json.dumps(body)
+            command += f" '{json_body}'"
+        elif body and isinstance(body, str):
+            command += f" '{body}'"
+
+        if query_params:
+            import urllib.parse
+            qs = urllib.parse.urlencode(query_params)
+            command += f" ?{qs}"
+
+        if additional_args:
+            command += f" {additional_args}"
+
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("httpie", url, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "httpie", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "httpie", "target": url,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
+        logger.info(f"🔍 Starting httpie request: {method} {url}")
+        result = execute_command(command, use_cache=False)
+        logger.info("📊 httpie request completed")
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in httpie endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 # ============================================================================
@@ -14355,6 +15665,18 @@ def zap():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("zap", params.get("target", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "zap", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "zap", "target": params.get("target", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting ZAP scan: {target}")
         result = execute_command(command)
         logger.info(f"📊 ZAP scan completed for {target}")
@@ -14384,6 +15706,18 @@ def wafw00f():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("wafw00f", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "wafw00f", command, params, 120), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "wafw00f", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🛡️ Starting Wafw00f WAF detection: {target}")
         result = execute_command(command)
         logger.info(f"📊 Wafw00f completed for {target}")
@@ -14417,6 +15751,18 @@ def fierce():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("fierce", params.get("domain", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "fierce", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "fierce", "target": params.get("domain", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting Fierce DNS recon: {domain}")
         result = execute_command(command)
         logger.info(f"📊 Fierce completed for {domain}")
@@ -14454,6 +15800,18 @@ def dnsenum():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("dnsenum", params.get("domain", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "dnsenum", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "dnsenum", "target": params.get("domain", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting DNSenum: {domain}")
         result = execute_command(command)
         logger.info(f"📊 DNSenum completed for {domain}")
@@ -14879,6 +16237,18 @@ def api_fuzzer():
             # Discover endpoints using wordlist
             command = f"ffuf -u {base_url}/FUZZ -w {wordlist} -mc 200,201,202,204,301,302,307,401,403,405 -t 50"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("api_fuzzer", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "api_fuzzer", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "api_fuzzer", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
             logger.info(f"🔍 Starting API endpoint discovery: {base_url}")
             result = execute_command(command)
             logger.info(f"📊 API endpoint discovery completed")
@@ -14897,13 +16267,12 @@ def api_fuzzer():
 
 @app.route("/api/tools/graphql_scanner", methods=["POST"])
 def graphql_scanner():
-    """Advanced GraphQL security scanning and introspection"""
+    """Advanced GraphQL security scanning using graphql-scanner tool (requires venv)"""
     try:
         params = request.json
         endpoint = params.get("endpoint", "")
-        introspection = params.get("introspection", True)
-        query_depth = params.get("query_depth", 10)
-        mutations = params.get("test_mutations", True)
+        scan_type = params.get("scan_type", "full")  # full, introspection, depth, batch
+        additional_args = params.get("additional_args", "")
 
         if not endpoint:
             logger.warning("🌐 GraphQL Scanner called without endpoint parameter")
@@ -14911,90 +16280,33 @@ def graphql_scanner():
                 "error": "GraphQL endpoint parameter is required"
             }), 400
 
+        # 使用 graphql-scanner 虚拟环境执行
+        venv_python = "/tools/graphql-scanner/graphql-venv/bin/python3"
+        scanner_script = "/tools/graphql-scanner/scan.py"
+        command = f"{venv_python} {scanner_script} -t {endpoint}"
+        if scan_type == "introspection":
+            command += " --header \"X-Test: introspection\""
+        if additional_args:
+            command += f" {additional_args}"
+
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("graphql_scanner", endpoint, params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "graphql_scanner", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "graphql_scanner", "target": endpoint,
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
+
         logger.info(f"🔍 Starting GraphQL security scan: {endpoint}")
+        result = execute_command(command, use_cache=False)
+        logger.info(f"📊 GraphQL scan completed")
 
-        results = {
-            "endpoint": endpoint,
-            "tests_performed": [],
-            "vulnerabilities": [],
-            "recommendations": []
-        }
-
-        # Test 1: Introspection query
-        if introspection:
-            introspection_query = '''
-            {
-                __schema {
-                    types {
-                        name
-                        fields {
-                            name
-                            type {
-                                name
-                            }
-                        }
-                    }
-                }
-            }
-            '''
-
-            clean_query = introspection_query.replace('\n', ' ').replace('  ', ' ').strip()
-            command = f"curl -s -X POST -H 'Content-Type: application/json' -d '{{\"query\":\"{clean_query}\"}}' '{endpoint}'"
-            result = execute_command(command, use_cache=False)
-
-            results["tests_performed"].append("introspection_query")
-
-            if "data" in result.get("stdout", ""):
-                results["vulnerabilities"].append({
-                    "type": "introspection_enabled",
-                    "severity": "MEDIUM",
-                    "description": "GraphQL introspection is enabled"
-                })
-
-        # Test 2: Query depth analysis
-        deep_query = "{ " * query_depth + "field" + " }" * query_depth
-        command = f"curl -s -X POST -H 'Content-Type: application/json' -d '{{\"query\":\"{deep_query}\"}}' {endpoint}"
-        depth_result = execute_command(command, use_cache=False)
-
-        results["tests_performed"].append("query_depth_analysis")
-
-        if "error" not in depth_result.get("stdout", "").lower():
-            results["vulnerabilities"].append({
-                "type": "no_query_depth_limit",
-                "severity": "HIGH",
-                "description": f"No query depth limiting detected (tested depth: {query_depth})"
-            })
-
-        # Test 3: Batch query testing
-        batch_query = '[' + ','.join(['{\"query\":\"{field}\"}' for _ in range(10)]) + ']'
-        command = f"curl -s -X POST -H 'Content-Type: application/json' -d '{batch_query}' {endpoint}"
-        batch_result = execute_command(command, use_cache=False)
-
-        results["tests_performed"].append("batch_query_testing")
-
-        if "data" in batch_result.get("stdout", "") and batch_result.get("success"):
-            results["vulnerabilities"].append({
-                "type": "batch_queries_allowed",
-                "severity": "MEDIUM",
-                "description": "Batch queries are allowed without rate limiting"
-            })
-
-        # Generate recommendations
-        if results["vulnerabilities"]:
-            results["recommendations"] = [
-                "Disable introspection in production",
-                "Implement query depth limiting",
-                "Add rate limiting for batch queries",
-                "Implement query complexity analysis",
-                "Add authentication for sensitive operations"
-            ]
-
-        logger.info(f"📊 GraphQL scan completed | Vulnerabilities found: {len(results['vulnerabilities'])}")
-
-        return jsonify({
-            "success": True,
-            "graphql_scan_results": results
-        })
+        return jsonify(result)
 
     except Exception as e:
         logger.error(f"💥 Error in GraphQL scanner: {str(e)}")
@@ -15016,6 +16328,12 @@ def jwt_analyzer():
                 "error": "JWT token parameter is required"
             }), 400
 
+        async_mode = params.get("async", False)
+
+        # JWT analysis is a fast inline Python operation (base64 decode + JSON parse)
+        # No need for async mode — proceed directly to analysis
+        if async_mode:
+            logger.info(f"🔐 JWT Analyzer: async mode not needed for inline analysis, processing synchronously")
         logger.info(f"🔍 Starting JWT security analysis")
 
         results = {
@@ -15134,6 +16452,18 @@ def api_schema_analyzer():
                 "error": "Schema URL parameter is required"
             }), 400
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("api_schema_analyzer", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "api_schema_analyzer", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "api_schema_analyzer", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔍 Starting API schema analysis: {schema_url}")
 
         # Fetch schema
@@ -15262,6 +16592,18 @@ def volatility3():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("volatility3", params.get("mem_file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "volatility3", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "volatility3", "target": params.get("mem_file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🧠 Starting Volatility3 analysis: {plugin}")
         result = execute_command(command)
         logger.info(f"📊 Volatility3 analysis completed")
@@ -15301,6 +16643,18 @@ def foremost():
 
         command += f" {input_file}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("foremost", params.get("image", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "foremost", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "foremost", "target": params.get("image", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"📁 Starting Foremost file carving: {input_file}")
         result = execute_command(command)
         result["output_directory"] = output_dir
@@ -15351,6 +16705,18 @@ def steghide():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("steghide", params.get("file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "steghide", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "steghide", "target": params.get("file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🖼️ Starting Steghide {action}: {cover_file}")
         result = execute_command(command)
         logger.info(f"📊 Steghide {action} completed")
@@ -15390,6 +16756,18 @@ def exiftool():
 
         command += f" {file_path}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("exiftool", params.get("file", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "exiftool", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "exiftool", "target": params.get("file", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"📷 Starting ExifTool analysis: {file_path}")
         result = execute_command(command)
         logger.info(f"📊 ExifTool analysis completed")
@@ -15422,6 +16800,18 @@ def hashpump():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("hashpump", params.get("hash", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "hashpump", command, params, 300), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "hashpump", "target": params.get("hash", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🔐 Starting HashPump attack")
         result = execute_command(command)
         logger.info(f"📊 HashPump attack completed")
@@ -15479,6 +16869,18 @@ def hakrawler():
         if additional_args:
             command += f" {additional_args}"
 
+        async_mode = params.get("async", False)
+
+        if async_mode:
+            task_id = async_task_manager.create_task("hakrawler", params.get("url", params.get("target", params.get("url", params.get("domain", "unknown")))), params)
+            thread = threading.Thread(
+                target=run_tool_async, args=(task_id, "hakrawler", command, params, 600), daemon=True)
+            thread.start()
+            return jsonify({
+                "success": True, "async": True, "task_id": task_id,
+                "status": "queued", "tool": "hakrawler", "target": params.get("url", params.get("target", params.get("url", "unknown"))),
+                "poll_endpoint": f"/api/tasks/{task_id}"
+            })
         logger.info(f"🕷️ Starting Hakrawler crawling: {url}")
         result = execute_command(command)
         logger.info(f"📊 Hakrawler crawling completed")
